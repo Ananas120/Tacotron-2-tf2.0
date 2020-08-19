@@ -2,7 +2,11 @@
 
 Tensorflow 2.x implementation of the Tacotron-2 model
 
-This repo is highly inspired from the https://github.com/NVIDIA/tacotron2 implementation
+This repo is highly inspired from the https://github.com/NVIDIA/tacotron2 implementation.
+
+Note : in fact this repo implements the SV2TTS Tacotron-2 but you can easily use it as Tacotron-2 by removing the speaker_embedding in the SV2TTSTacotron2 call() and infer() method
+
+You can also use it as pretrained model with the NVIDIA's pretrained model by creating the 2 models and passing them to my convertor script (other repo on my github). 
 
 ## Known limitations : 
 
