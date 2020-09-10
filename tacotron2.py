@@ -4,6 +4,7 @@ import tensorflow.keras.backend as K
 from tensorflow.keras.layers import *
 
 from location_attention import LocationAttention
+from current_blocks import Conv1DBN
 
 _rnn_impl = 2
 
@@ -27,12 +28,13 @@ class Prenet(tf.keras.Model):
                   name = 'prenet_layer_{}'.format(i+1)) 
             for i, size in enumerate(sizes)
         ]
+        self.dropout = Dropout(drop_rate)
         
     def call(self, inputs):
         x = inputs
         for layer in self.denses:
             x = layer(x)
-            x = K.dropout(x, self.drop_rate)
+            x = self.dropout(x, training = True)
         return x
     
     def get_config(self):
@@ -83,44 +85,50 @@ def Postnet(n_mel_channels = 80,
     return model
     
 
-
 def TacotronEncoder(vocab_size, 
-                    speaker_embedding_dim,
-                    input_layer     = None,
                     encoder_embedding_dims  = 512, 
                     encoder_n_convolutions  = 3, 
                     encoder_kernel_size     = 5,
+                    encoder_bias            = True,
+                    encoder_activation      = 'relu',
+                    encoder_bnorm           = 'after',
                     encoder_epsilon         = 1e-5,
                     encoder_momentum        = 0.1,
                     encoder_drop_rate       = 0.5,
+                    
+                    layer_name  = 'encoder_conv_{}',
                     name    = "Tacotron2_encoder"
                    ):
-    inputs = Input(shape = (None,), dtype = tf.int32, name = "encoder_text_inputs") if input_layer is None else input_layer
+    model = tf.keras.Sequential(name = name)
     
-    embedded_inputs = Embedding(vocab_size, encoder_embedding_dims, 
-                                name = "encoder_embeddings")(inputs)
+    model.add(Embedding(vocab_size, encoder_embedding_dims, 
+                        name = "encoder_embeddings"))
     
-    x = embedded_inputs
     for i in range(encoder_n_convolutions):
-        x = Conv1D(encoder_embedding_dims, 
-                   kernel_size = encoder_kernel_size, 
-                   padding = 'same', 
-                   name = 'encoder_conv_{}'.format(i+1))(x)
-        
-        x = BatchNormalization(epsilon = 1e-5, momentum = 0.1)(x)
-        x = Activation('relu')(x)
-        x = Dropout(encoder_drop_rate)(x)
+        config = {
+            'filters'        : encoder_embedding_dims,
+            'kernel_size'    : _get_var(encoder_kernel_size, i),
+            'use_bias'       : _get_var(encoder_bias, i),
+            'strides'        : 1,
+            'padding'        : 'same',
+            'activation'     : _get_var(encoder_activation, i),
+            'bnorm'          : _get_var(encoder_bnorm, i),
+            'momentum'       : _get_var(encoder_momentum, i),
+            'epsilon'        : _get_var(encoder_epsilon, i),
+            'drop_rate'      : _get_var(encoder_drop_rate, i),
+            'name'           : layer_name.format(i+1)
+        }
+        Conv1DBN(model, ** config)
     
-    x = Bidirectional(LSTM((encoder_embedding_dims - speaker_embedding_dim) // 2, return_sequences = True), 
-                      name = "encoder_lstm")(x)
+    model.add(Bidirectional(LSTM(
+        encoder_embedding_dims // 2, return_sequences = True, implementation = _rnn_impl
+    ), name = "encoder_lstm"))
     
-    if input_layer is None:
-        return tf.keras.Model(inputs, x, name = name)
-    else:
-        return x
+    model.build((None, None))
+    
+    return model
 
-
-class SV2TTSTacotronDecoder(tf.keras.Model):
+class TacotronDecoder(tf.keras.Model):
     def __init__(self, 
                  n_mel_channels  = 80, 
                  n_frames_per_step  = 1,
@@ -153,7 +161,7 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
                  early_stopping     = True,
                  ** kwargs
                 ):
-        super(SV2TTSTacotronDecoder, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.kwargs = kwargs
         self.n_mel_channels     = n_mel_channels
         self.n_frames_per_step  = n_frames_per_step
@@ -246,7 +254,7 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
         attn_context = tf.zeros((B, enc_hidden_size))
         
         return [attn_rnn_states, decoder_rnn_states, attn_weights, attn_weights_cum, attn_context]
-        
+    
     def decode_step(self, decoder_input, memory, processed_memory, states, 
                     debug = False):
         attn_rnn_states, decoder_rnn_states, attn_weights, attn_weights_cum, attn_context = states
@@ -274,66 +282,27 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
         if debug:
             print("cell_out : {}".format(tuple(cell_out)))
             print("new_attn_context : {}".format(tuple(new_attn_context.shape)))
-            
+        
         decoder_rnn_input = tf.concat([
             cell_out, new_attn_context
         ], axis = -1)
-        decoder_rnn_out, new_decoder_rnn_states = self.decoder_rnn(decoder_rnn_input, decoder_rnn_states)
-            
-        decoder_out_attn_context = tf.concat([
+        decoder_rnn_out, new_decoder_rnn_state = self.decoder_rnn(decoder_rnn_input, decoder_rnn_states)
+        
+        decoder_rnn_out_cat = tf.concat([
             decoder_rnn_out, new_attn_context
         ], axis = -1)
-            
-        decoder_output = self.linear_projection(decoder_out_attn_context)
-            
-        gate_prediction = self.gate_layer(decoder_out_attn_context)
-            
+        
         new_states = [
             new_attn_rnn_states,
-            new_decoder_rnn_states,
+            new_decoder_rnn_state,
             new_attn_weights,
             new_attn_weights_cum,
             new_attn_context
         ]
                         
-        return [decoder_output, gate_prediction, attn_weights], new_states
+        return [decoder_rnn_out_cat, attn_weights], new_states
     
-    #@tf.function
-    def call_old(self, inputs, initial_states = None, debug = False):
-        memory, input_frames = inputs
-        processed_memory = self.attention_layer.process_memory(memory)
-        
-        states = initial_states
-        if states is None:
-            memory_shape = (tf.shape(memory)[0], tf.shape(memory)[1], tf.shape(memory)[-1])
-            states = self.get_initial_state(memory_shape)
-        
-        n_frames = tf.shape(input_frames)[1]
-        mel_outputs, gate_outputs, attn_weights = [], [], []
-        for i in range(n_frames):
-            mel_frame = input_frames[:,i]
-            
-            decoder_input = self.prenet(mel_frame)
-            
-            outputs, states = self.decode_step(decoder_input, memory, 
-                                                    processed_memory, states, 
-                                                    debug = debug
-                                                   )
-            mel_output, gate_output, attn_weight = outputs
-            
-            mel_outputs     += [tf.expand_dims(mel_output, axis = 1)]
-            gate_outputs    += [tf.expand_dims(gate_output, axis = 1)]
-            attn_weights    += [tf.expand_dims(attn_weight, axis = 1)]
-                        
-        mel_outputs = tf.concat(mel_outputs, axis = 1)
-        gate_outputs = tf.concat(gate_outputs, axis = 1)
-        attn_weights = tf.concat(attn_weights, axis = 1)
-        
-        mel_outputs_postnet = self.postnet(mel_outputs)
-        mel_outputs_postnet = mel_outputs + mel_outputs_postnet
-        
-        return (mel_outputs, mel_outputs_postnet, gate_outputs, attn_weights), states
-        
+    #@tf.function(experimental_relax_shapes = True)
     def call(self, inputs, initial_states = None, debug = False):
         memory, mel_inputs = inputs
         
@@ -358,8 +327,12 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
                                        initial_states
                                       )
         
-        mel_outputs, gate_outputs, attn_weights = outputs
-        
+        decoder_output, attn_weights = outputs
+                
+        mel_outputs = self.linear_projection(decoder_output)
+            
+        gate_outputs = self.gate_layer(decoder_output)
+                
         mel_outputs_postnet = self.postnet(mel_outputs)
         mel_outputs_postnet = mel_outputs + mel_outputs_postnet
 
@@ -388,7 +361,10 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
                                                     processed_memory, states, 
                                                     debug = debug
                                                    )
-            mel_output, gate_output, attn_weight = outputs
+            decoder_output, attn_weight = outputs
+            
+            mel_output  = self.linear_projection(decoder_output)
+            gate_output = self.gate_layer(decoder_output)
             
             mel_outputs     += [tf.expand_dims(mel_output, axis = 1)]
             gate_outputs    += [tf.expand_dims(gate_output, axis = 1)]
@@ -451,14 +427,12 @@ class SV2TTSTacotronDecoder(tf.keras.Model):
         
         return config
         
-class SV2TTSTacotron2(tf.keras.Model):
+class Tacotron2(tf.keras.Model):
     def __init__(self, 
-                 vocab_size = 148,
-                 speaker_embedding_dim = 64,
+                 vocab_size,
                  n_mel_channels     = 80, 
                  n_frames_per_step  = 1,
                  with_logits        = True,
-                 decrease_encoder_embedding = False,
                  
                  encoder_embedding_dims  = 512, 
                  encoder_n_convolutions  = 3, 
@@ -487,17 +461,15 @@ class SV2TTSTacotron2(tf.keras.Model):
                  early_stopping     = True,
                  **kwargs
                 ):
-        super(SV2TTSTacotron2, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         
         self.vocab_size         = vocab_size
-        self.speaker_embedding_dim  = speaker_embedding_dim
         self.encoder_embedding_dims = encoder_embedding_dims
         self.encoder_n_convolutions = encoder_n_convolutions
         self.encoder_kernel_size    = encoder_kernel_size
         self.encoder_epsilon        = encoder_epsilon
         self.encoder_momentum       = encoder_momentum
         self.encoder_drop_rate      = encoder_drop_rate
-        self.decrease_encoder_embedding = decrease_encoder_embedding
         
         self.with_logits        = with_logits
         self.n_mel_channels     = n_mel_channels
@@ -523,7 +495,6 @@ class SV2TTSTacotron2(tf.keras.Model):
         
         self.encoder = TacotronEncoder(
             vocab_size, 
-            speaker_embedding_dim   = speaker_embedding_dim if decrease_encoder_embedding else None,
             encoder_embedding_dims  = encoder_embedding_dims, 
             encoder_n_convolutions  = encoder_n_convolutions,
             encoder_kernel_size     = encoder_kernel_size,
@@ -533,7 +504,7 @@ class SV2TTSTacotron2(tf.keras.Model):
             name = "encoder"
         )
         
-        self.decoder = SV2TTSTacotronDecoder(
+        self.decoder = TacotronDecoder(
             n_mel_channels       = n_mel_channels,
             n_frames_per_step    = n_frames_per_step,
             with_logits          = with_logits,
@@ -559,10 +530,14 @@ class SV2TTSTacotron2(tf.keras.Model):
             name = "decoder"
         )
         
+    @property
+    def encoder_embedding_dim(self):
+        return self.encoder.output_shape[-1]
         
     def get_initial_state(self, *args, **kwargs):
         return self.decoder.get_initial_state(*args, **kwargs)
-    
+        
+    @tf.function(experimental_relax_shapes = True)
     def call(self, inputs, initial_states = None):
         """
             Forward pass with theacher forcing (decoder_mel is provided)
@@ -575,46 +550,30 @@ class SV2TTSTacotron2(tf.keras.Model):
                     - decoder_inputs : mel spectrogram input (first frame is go_frame)
                         shape : (batch_size, mel_length, n_mel_channels)
         """
-        encoder_inputs, speaker_embedded, decoder_inputs = inputs
+        encoder_inputs, decoder_inputs = inputs
         
-        # Shape == (batch_size, text_length, encoder_embedding_dim)
-        encoder_output = self.encoder(encoder_inputs)
-        
-        speaker_embedded = tf.expand_dims(speaker_embedded, 1)
-        speaker_embedded = tf.tile(speaker_embedded, [1, tf.shape(encoder_inputs)[-1], 1])
-        
-        encoder_output_cat = tf.concat([encoder_output, speaker_embedded], axis = -1)
+        encoder_embedding = self.encoder(encoder_inputs)
         
         return self.decoder(
-            [encoder_output_cat, decoder_inputs], initial_states = initial_states
+            [encoder_embedding, decoder_inputs], initial_states = initial_states
         )
         
     def infer(self, inputs, **kwargs):
-        encoder_inputs, speaker_embedded = inputs
+        encoder_embedding = self.encoder(inputs)
         
-        # Shape == (batch_size, text_length, encoder_embedding_dim)
-        encoder_output = self.encoder(encoder_inputs)
-        
-        speaker_embedded = tf.expand_dims(speaker_embedded, 1)
-        speaker_embedded = tf.tile(speaker_embedded, [1, tf.shape(encoder_inputs)[-1], 1])
-        
-        encoder_output_cat = tf.concat([encoder_output, speaker_embedded], axis = -1)
-        
-        outputs = self.decoder.infer(encoder_output_cat, **kwargs)
+        outputs = self.decoder.infer(encoder_embedding, **kwargs)
         
         return outputs
         
     def get_config(self):
         config = {}
-        config['vocab_size']              = self.vocab_size
-        config['speaker_embedding_dim']   = self.speaker_embedding_dim
-        config['encoder_embedding_dims']  = self.encoder_embedding_dims
-        config['encoder_n_convolutions']  = self.encoder_n_convolutions
-        config['encoder_kernel_size']     = self.encoder_kernel_size
-        config['encoder_epsilon']         = self.encoder_epsilon
-        config['encoder_momentum']        = self.encoder_momentum
-        config['encoder_drop_rate']       = self.encoder_drop_rate
-        config['decrease_encoder_embedding']    = self.decrease_encoder_embedding
+        config['vocab_size']                = self.vocab_size
+        config['encoder_embedding_dims']    = self.encoder_embedding_dims
+        config['encoder_n_convolutions']    = self.encoder_n_convolutions
+        config['encoder_kernel_size']       = self.encoder_kernel_size
+        config['encoder_epsilon']           = self.encoder_epsilon
+        config['encoder_momentum']          = self.encoder_momentum
+        config['encoder_drop_rate']         = self.encoder_drop_rate
         
         config['n_mel_channels']    = self.n_mel_channels
         config['n_frames_per_step'] = self.n_frames_per_step
@@ -644,4 +603,3 @@ class SV2TTSTacotron2(tf.keras.Model):
     def from_config(cls, config, custom_objects = None):
         return cls(**config)
         
-    

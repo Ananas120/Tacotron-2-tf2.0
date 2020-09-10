@@ -31,12 +31,8 @@ class TacotronLoss(tf.keras.losses.Loss):
             mel_loss *= mask
             mel_postnet_loss *= mask
             
-            nb_values = tf.reduce_sum(mask) * tf.cast(tf.shape(mel_loss)[-1], tf.float32)
-            mel_loss            = tf.reduce_sum(mel_loss) / nb_values
-            mel_postnet_loss    = tf.reduce_sum(mel_postnet_loss) / nb_values
-        else:
-            mel_loss            = tf.reduce_mean(mel_loss)
-            mel_postnet_loss    = tf.reduce_mean(mel_postnet_loss)
+        mel_loss            = tf.reduce_mean(mel_loss)
+        mel_postnet_loss    = tf.reduce_mean(mel_postnet_loss)
             
         gate_loss   = tf.reduce_mean(gate_loss)
         total_loss  = mel_loss + mel_postnet_loss + gate_loss
