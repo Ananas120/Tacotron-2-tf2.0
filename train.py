@@ -12,7 +12,7 @@ def train_step(model, loss_fn, optimizer, batch, max_train_frames = 25):
         
     def optimize_step(sub_inputs, state, sub_target):
         with tf.GradientTape() as tape:
-            pred, new_state = self.tts_model(sub_inputs, state)
+            pred, new_state = model(sub_inputs, state)
 
             loss, mel_loss, mel_post_loss, gate_loss = loss_fn(sub_target, pred)
                         
@@ -57,16 +57,18 @@ def train_step(model, loss_fn, optimizer, batch, max_train_frames = 25):
 
     return total_loss
 
-model = Tacotron2()
+model = Tacotron2(vocab_size = 148)
 loss_fn = TacotronLoss()
 optimizer = tf.keras.optimizers.Adam()
 
-batch_size = 16
-length = 100
+batch_size = 64
+length = 400
 
-txt_inp = tf.ones((batch_size, text_length), dtype = tf.int32)
+txt_inp = tf.ones((batch_size, 150), dtype = tf.int32)
 mel_inp = tf.ones((batch_size, length, 80), dtype = tf.float32)
 gate_inp = tf.ones((batch_size, length), dtype = tf.float32)
+
+_ = model((txt_inp, mel_inp))
 
 batch = ((txt_inp, mel_inp), (mel_inp, gate_inp))
 
